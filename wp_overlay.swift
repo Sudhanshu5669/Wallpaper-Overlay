@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import QuartzCore
+import CoreMedia
 
 // Helper to check if a file is a supported video format (.mov or .mp4)
 func isVideoFile(_ fileName: String) -> Bool {
@@ -50,22 +51,40 @@ guard !videoFiles.isEmpty else {
 
 print("Loading \(videoFiles.count) video(s) from \(videoDir)")
 
-// ---------------------------------------------------------------------------
-// ScreenEntry: one self-contained overlay per physical display.
-//
-// FIX: Give each screen its OWN AVPlayer so every display gets an independent
-// GPU render path. Sharing a single AVQueuePlayer across multiple AVPlayerLayer
-// instances on different NSWindows causes stuttering and desync on external screens.
-// ---------------------------------------------------------------------------
-struct ScreenEntry {
-    let displayID: CGDirectDisplayID
-    let window: NSWindow
-    let player: AVPlayer  // per-screen player
-}
-
 // Build fresh AVPlayerItems for the given video files
 func makePlayerItems() -> [AVPlayerItem] {
-    videoFiles.map { AVPlayerItem(url: URL(fileURLWithPath: "\(videoDir)/\($0)")) }
+    videoFiles.compactMap { filename -> AVPlayerItem? in
+        let url = URL(fileURLWithPath: "\(videoDir)/\(filename)")
+        let asset = AVURLAsset(url: url)
+
+        // OPTIMIZATION: Extract only the video track. Stripping the audio track completely
+        // prevents macOS from allocating audio decoding pipelines, saving CPU demuxing/decoding cycles.
+        let composition = AVMutableComposition()
+        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+            return AVPlayerItem(url: url)
+        }
+
+        guard let compositionVideoTrack = composition.addMutableTrack(
+            withMediaType: .video,
+            preferredTrackID: kCMPersistentTrackID_Invalid
+        ) else {
+            return AVPlayerItem(url: url)
+        }
+
+        do {
+            try compositionVideoTrack.insertTimeRange(
+                CMTimeRange(start: .zero, duration: asset.duration),
+                of: videoTrack,
+                at: .zero
+            )
+            // Retain natural transformation (e.g. rotation metadata)
+            compositionVideoTrack.preferredTransform = videoTrack.preferredTransform
+
+            return AVPlayerItem(asset: composition)
+        } catch {
+            return AVPlayerItem(url: url)
+        }
+    }
 }
 
 // Return the CoreGraphics display ID for a given NSScreen (nil if unavailable)
@@ -73,33 +92,32 @@ func displayID(for screen: NSScreen) -> CGDirectDisplayID? {
     screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
 }
 
-// ---------------------------------------------------------------------------
-// WallpaperOverlayApp: manages one ScreenEntry per connected display.
-// Keyed by CGDirectDisplayID so we can add/remove displays without touching
-// unrelated windows, preventing any flash on unaffected screens.
-// ---------------------------------------------------------------------------
+struct ScreenEntry {
+    let displayID: CGDirectDisplayID
+    let window: NSWindow
+    let player: AVPlayer
+}
+
 class WallpaperOverlayApp {
     @MainActor var entries: [CGDirectDisplayID: ScreenEntry] = [:]
+    @MainActor var isPaused = false
 
-    // ------------------------------------------------------------------
-    // makeEntry: build an NSWindow + AVPlayer for one physical screen
-    // ------------------------------------------------------------------
     @MainActor
     func makeEntry(for screen: NSScreen) -> ScreenEntry? {
         guard let did = displayID(for: screen) else { return nil }
 
-        // Independent looping player for this screen
         let screenPlayer = AVQueuePlayer(items: makePlayerItems())
+        // OPTIMIZATION: Disable audio routing and energy-inhibiting behaviors
+        screenPlayer.volume = 0.0
         screenPlayer.isMuted = true
+        screenPlayer.preventsDisplaySleepDuringVideoPlayback = false
 
-        // Re-queue finished items so playback loops forever
         NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: nil,
             queue: .main
         ) { note in
             guard let ended = note.object as? AVPlayerItem else { return }
-            // Only handle items belonging to this screen's player
             if screenPlayer.items().contains(ended) || screenPlayer.currentItem == ended {
                 let copy = ended.copy() as! AVPlayerItem
                 copy.seek(to: .zero, completionHandler: nil)
@@ -107,16 +125,20 @@ class WallpaperOverlayApp {
             }
         }
 
-        // contentView uses local (0,0) coords; window is positioned globally
         let localFrame = NSRect(origin: .zero, size: screen.frame.size)
         let contentView = NSView(frame: localFrame)
         contentView.wantsLayer = true
         contentView.layer?.backgroundColor = NSColor.black.cgColor
+        // OPTIMIZATION: Tell WindowServer compositor layer blending isn't required
+        contentView.layer?.isOpaque = true
 
         let playerLayer = AVPlayerLayer(player: screenPlayer)
         playerLayer.frame = localFrame
         playerLayer.videoGravity = .resizeAspectFill
         playerLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        // OPTIMIZATION: GPU-accelerated drawing and opaque configuration
+        playerLayer.isOpaque = true
+        playerLayer.drawsAsynchronously = true
         contentView.layer?.addSublayer(playerLayer)
 
         let window = NSWindow(
@@ -126,8 +148,6 @@ class WallpaperOverlayApp {
             defer: false
         )
         window.contentView = contentView
-        // Sit just above the macOS system wallpaper layer so our overlay
-        // always wins, but below desktop icons and all normal app windows
         window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) - 1)
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         window.isReleasedWhenClosed = false
@@ -135,33 +155,26 @@ class WallpaperOverlayApp {
         window.hasShadow = false
         window.ignoresMouseEvents = true
         window.backgroundColor = NSColor.black
-        // Explicitly set global frame so the window lands on the right screen
         window.setFrame(screen.frame, display: true)
         window.orderFront(nil)
 
-        screenPlayer.play()
+        if !isPaused {
+            screenPlayer.play()
+        }
 
         return ScreenEntry(displayID: did, window: window, player: screenPlayer)
     }
 
-    // ------------------------------------------------------------------
-    // rebuildWindows: full teardown + rebuild.
-    // Called ONLY when display hardware changes (monitor plugged/unplugged).
-    // Uses orderOut (hide) not close (AppKit event), so no flash on
-    // screens that stay connected.
-    // ------------------------------------------------------------------
     @MainActor
     func rebuildWindows() {
         let currentScreens = NSScreen.screens
         let currentIDs = Set(currentScreens.compactMap { displayID(for: $0) })
 
-        // Remove entries for displays that are gone
         for (did, entry) in entries where !currentIDs.contains(did) {
             entry.window.orderOut(nil)
             entries.removeValue(forKey: did)
         }
 
-        // Add entries for new displays; leave untouched ones alone
         for screen in currentScreens {
             guard let did = displayID(for: screen), entries[did] == nil else { continue }
             if let entry = makeEntry(for: screen) {
@@ -170,11 +183,6 @@ class WallpaperOverlayApp {
         }
     }
 
-    // ------------------------------------------------------------------
-    // refreshWindows: soft refresh on space/desktop switch.
-    // Never destroys any window — just brings them all to front.
-    // If a display appears that has no entry yet, we add only that entry.
-    // ------------------------------------------------------------------
     @MainActor
     func refreshWindows() {
         let currentScreens = NSScreen.screens
@@ -183,10 +191,8 @@ class WallpaperOverlayApp {
         for screen in currentScreens {
             guard let did = displayID(for: screen) else { continue }
             if let entry = entries[did] {
-                // Window already exists for this screen — just re-raise it
                 entry.window.orderFront(nil)
             } else {
-                // New display appeared mid-session — add just this one
                 if let entry = makeEntry(for: screen) {
                     entries[did] = entry
                     addedAny = true
@@ -194,14 +200,30 @@ class WallpaperOverlayApp {
             }
         }
 
-        // Also clean up orphaned entries (display disconnected during space switch)
         let currentIDs = Set(currentScreens.compactMap { displayID(for: $0) })
         for did in entries.keys where !currentIDs.contains(did) {
             entries[did]?.window.orderOut(nil)
             entries.removeValue(forKey: did)
         }
 
-        _ = addedAny // suppress unused warning
+        _ = addedAny
+    }
+
+    // OPTIMIZATION: Pause rendering/play when screen locks or monitor sleeps
+    @MainActor
+    func pausePlayback() {
+        isPaused = true
+        for entry in entries.values {
+            entry.player.pause()
+        }
+    }
+
+    @MainActor
+    func resumePlayback() {
+        isPaused = false
+        for entry in entries.values {
+            entry.player.play()
+        }
     }
 }
 
@@ -212,7 +234,7 @@ Task { @MainActor in
     appController.rebuildWindows()
 }
 
-// Monitor plugged in or out → reconcile display list
+// Monitor changes → reconcile
 NotificationCenter.default.addObserver(
     forName: NSApplication.didChangeScreenParametersNotification,
     object: nil,
@@ -223,7 +245,7 @@ NotificationCenter.default.addObserver(
     }
 }
 
-// Active space/desktop changed → soft re-raise only (no window destruction)
+// Active space changed → soft refresh
 NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.activeSpaceDidChangeNotification,
     object: nil,
@@ -231,6 +253,47 @@ NSWorkspace.shared.notificationCenter.addObserver(
 ) { _ in
     Task { @MainActor in
         appController.refreshWindows()
+    }
+}
+
+// OPTIMIZATION: Stop playback on Screen Sleep/Lock to drop CPU usage to 0%
+NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.screensDidSleepNotification,
+    object: nil,
+    queue: .main
+) { _ in
+    Task { @MainActor in
+        appController.pausePlayback()
+    }
+}
+
+NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.screensDidWakeNotification,
+    object: nil,
+    queue: .main
+) { _ in
+    Task { @MainActor in
+        appController.resumePlayback()
+    }
+}
+
+NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.sessionDidResignActiveNotification,
+    object: nil,
+    queue: .main
+) { _ in
+    Task { @MainActor in
+        appController.pausePlayback()
+    }
+}
+
+NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.sessionDidBecomeActiveNotification,
+    object: nil,
+    queue: .main
+) { _ in
+    Task { @MainActor in
+        appController.resumePlayback()
     }
 }
 
