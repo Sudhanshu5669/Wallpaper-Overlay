@@ -16,6 +16,7 @@ if [ -d "$VIDEOS_DIR" ]; then
     VIDEO_COUNT=$(find "$VIDEOS_DIR" -maxdepth 1 \( -iname "*.mov" -o -iname "*.mp4" \) | wc -l | tr -d ' ')
 fi
 
+
 if [ "$VIDEO_COUNT" -eq 0 ]; then
     echo "No .mov or .mp4 files found in workspace folder: $VIDEOS_DIR"
     echo "Checking system videos directory..."
